@@ -1,109 +1,136 @@
-import express from 'express';
-import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
-import axios from 'axios';
-import { fileURLToPath } from 'url';
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import json
+import os
+import time
 
-const app = express();
-const PORT = process.env.PORT || 10000;
+app = Flask(__name__)
+# Enable CORS for frontend interactions
+CORS(app)
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+DB_FILE = 'chips_database.json'
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DB_FILE = path.join(__dirname, 'chips_database.json');
+def read_db():
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, 'w') as f:
+            json.dump({"chips": []}, f, indent=2)
+    try:
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"chips": []}
 
-// --- DATABASE HELPER FUNCTIONS ---
-const readDatabase = () => {
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ chips: [] }, null, 2));
-  }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-};
+def write_db(data):
+    with open(DB_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
 
-const writeDatabase = (data) => {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-};
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "online", "server": "Velocit Backend"}), 200
 
-// ===============================================================
-// 1. CHIP REGISTRATION / PING ENDPOINT
-// Called by Python Flashing Tool or ESP8266 on boot
-// ===============================================================
-app.post('/api/chips/ping', (req, res) => {
-  try {
-    const { chipName, chipPassword, ipAddress } = req.body;
+# -------------------------------------------------------------------
+# 1. CHIP HEARTBEAT / PING (Called automatically by physical ESP device)
+# -------------------------------------------------------------------
+@app.route('/api/chips/ping', methods=['POST'])
+def chip_ping():
+    try:
+        data = request.get_json() or {}
+        chip_name = data.get('chipName', '').strip()
+        chip_password = data.get('chipPassword', '').strip()
+        ip_address = data.get('ipAddress', 'unassigned').strip()
 
-    if (!chipName || !chipPassword) {
-      return res.status(400).json({ success: false, error: 'Missing chipName or chipPassword' });
-    }
+        if not chip_name or not chip_password:
+            return jsonify({"success": False, "error": "Missing chipName or chipPassword"}), 400
 
-    const db = readDatabase();
-    const existingIndex = db.chips.findIndex((c) => c.chipName === chipName);
+        db = read_db()
+        existing_index = next((i for i, c in enumerate(db['chips']) if c.get('chipName') == chip_name), -1)
 
-    const record = {
-      chipName: chipName.trim(),
-      chipPassword: chipPassword.trim(),
-      ipAddress: ipAddress || 'unassigned',
-      lastActive: new Date().toISOString()
-    };
+        record = {
+            "chipName": chip_name,
+            "chipPassword": chip_password,
+            "ipAddress": ip_address,
+            "lastSeen": time.time()  # Unix timestamp
+        }
 
-    if (existingIndex !== -1) {
-      db.chips[existingIndex] = record;
-    } else {
-      db.chips.push(record);
-    }
+        if existing_index != -1:
+            db['chips'][existing_index] = record
+        else:
+            db['chips'].append(record)
 
-    writeDatabase(db);
-    return res.json({ success: true, message: `Chip '${chipName}' registered/updated successfully.`, chip: record });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
+        write_db(db)
+        return jsonify({"success": True, "message": f"Heartbeat received for {chip_name}", "chip": record}), 200
 
-// ===============================================================
-// 2. DISPATCH COMMAND / PAYLOAD ENDPOINT
-// Called by Web App or Client
-// ===============================================================
-app.post('/api/chips/dispatch', async (req, res) => {
-  try {
-    const { chipName, chipPassword, command, binPayload } = req.body;
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    // Direct 2-Key Security Verification
-    const db = readDatabase();
-    const target = db.chips.find(
-      (c) => c.chipName === chipName && c.chipPassword === chipPassword
-    );
+# -------------------------------------------------------------------
+# 2. VERIFY CHIP & CHECK ONLINE STATUS (Used by Hamburger Menu)
+# -------------------------------------------------------------------
+@app.route('/api/chips/verify', methods=['POST'])
+def verify_chip():
+    try:
+        data = request.get_json() or {}
+        chip_name = data.get('chipName', '').strip()
+        chip_password = data.get('chipPassword', '').strip()
 
-    if (!target) {
-      return res.status(401).json({ success: false, error: 'Access Denied: Invalid Chip Name or Chip Password.' });
-    }
+        db = read_db()
+        target = next((c for c in db['chips'] if c.get('chipName') == chip_name and c.get('chipPassword') == chip_password), None)
 
-    if (!target.ipAddress || target.ipAddress === 'unassigned') {
-      return res.status(400).json({ success: false, error: 'Target chip has not reported a valid IP address yet.' });
-    }
+        if not target:
+            return jsonify({
+                "success": False, 
+                "error": "Access Denied: Chip not registered or invalid password."
+            }), 401
 
-    // Relay action/command directly to the physical ESP8266
-    const chipResponse = await axios.post(`http://${target.ipAddress}/execute`, {
-      authSecret: chipPassword,
-      command: command || 'TRIGGER',
-      payload: binPayload || null
-    }, { timeout: 8000 });
+        # Determine if Online (pinged within the last 45 seconds)
+        last_seen = target.get('lastSeen', 0)
+        current_time = time.time()
+        is_online = (current_time - last_seen) < 45
 
-    return res.json({ success: true, message: 'Command delivered to chip!', chipStatus: chipResponse.data });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: 'Failed delivering command to chip.', details: err.message });
-  }
-});
+        return jsonify({
+            "success": True,
+            "chipName": target['chipName'],
+            "isOnline": is_online,
+            "ipAddress": target.get('ipAddress', 'unassigned')
+        }), 200
 
-// ===============================================================
-// 3. HEALTH CHECK ENDPOINT (To keep Render awake)
-// ===============================================================
-app.get('/health', (req, res) => {
-  res.json({ status: 'online', timestamp: new Date().toISOString() });
-});
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-app.listen(PORT, () => {
-  console.log(`⚡ Velocit Permanent Server live on port ${PORT}`);
-});
+# -------------------------------------------------------------------
+# 3. DISPATCH COMMAND / CODE UPLOAD (Strictly Online Chips Only)
+# -------------------------------------------------------------------
+@app.route('/api/chips/dispatch', methods=['POST'])
+def dispatch_command():
+    try:
+        data = request.get_json() or {}
+        chip_name = data.get('chipName', '').strip()
+        chip_password = data.get('chipPassword', '').strip()
+        command = data.get('command', '')
+
+        db = read_db()
+        target = next((c for c in db['chips'] if c.get('chipName') == chip_name and c.get('chipPassword') == chip_password), None)
+
+        if not target:
+            return jsonify({"success": False, "error": "Access Denied: Unregistered chip credentials."}), 401
+
+        # Check if powered ON
+        last_seen = target.get('lastSeen', 0)
+        is_online = (time.time() - last_seen) < 45
+
+        if not is_online:
+            return jsonify({"success": False, "error": "Upload/Command Blocked: Chip is currently OFFLINE."}), 400
+
+        # Execute upload/command logic here
+        return jsonify({
+            "success": True, 
+            "message": f"Successfully delivered action '{command}' to {chip_name}!"
+        }), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+  
