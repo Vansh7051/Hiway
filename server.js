@@ -1,35 +1,19 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import json
-import os
 import time
 
 app = Flask(__name__)
-# Enable CORS for frontend interactions
 CORS(app)
 
-DB_FILE = 'chips_database.json'
-
-def read_db():
-    if not os.path.exists(DB_FILE):
-        with open(DB_FILE, 'w') as f:
-            json.dump({"chips": []}, f, indent=2)
-    try:
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {"chips": []}
-
-def write_db(data):
-    with open(DB_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+# Memory store for active ESP8266 heartbeats (Resets on restart, costs $0)
+active_pings = {}
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "online", "server": "Velocit Backend"}), 200
+    return jsonify({"status": "online", "server": "Velocit Stateless Gateway"}), 200
 
 # -------------------------------------------------------------------
-# 1. CHIP HEARTBEAT / PING (Called automatically by physical ESP device)
+# 1. ESP8266 DEVICE HEARTBEAT (Called by physical ESP)
 # -------------------------------------------------------------------
 @app.route('/api/chips/ping', methods=['POST'])
 def chip_ping():
@@ -40,97 +24,67 @@ def chip_ping():
         ip_address = data.get('ipAddress', 'unassigned').strip()
 
         if not chip_name or not chip_password:
-            return jsonify({"success": False, "error": "Missing chipName or chipPassword"}), 400
+            return jsonify({"success": False, "error": "Missing credentials"}), 400
 
-        db = read_db()
-        existing_index = next((i for i, c in enumerate(db['chips']) if c.get('chipName') == chip_name), -1)
-
-        record = {
-            "chipName": chip_name,
+        # Store last seen timestamp in server RAM
+        active_pings[chip_name] = {
             "chipPassword": chip_password,
             "ipAddress": ip_address,
-            "lastSeen": time.time()  # Unix timestamp
+            "lastSeen": time.time()
         }
 
-        if existing_index != -1:
-            db['chips'][existing_index] = record
-        else:
-            db['chips'].append(record)
-
-        write_db(db)
-        return jsonify({"success": True, "message": f"Heartbeat received for {chip_name}", "chip": record}), 200
+        return jsonify({"success": True, "message": f"Heartbeat received for {chip_name}"}), 200
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 # -------------------------------------------------------------------
-# 2. VERIFY CHIP & CHECK ONLINE STATUS (Used by Hamburger Menu)
+# 2. CHECK CHIP ONLINE STATUS (Called by User Frontend)
 # -------------------------------------------------------------------
-@app.route('/api/chips/verify', methods=['POST'])
-def verify_chip():
+@app.route('/api/chips/check-status', methods=['POST'])
+def check_status():
     try:
         data = request.get_json() or {}
-        chip_name = data.get('chipName', '').strip()
-        chip_password = data.get('chipPassword', '').strip()
+        user_chips = data.get('chips', [])  # User sends their list stored in Google Drive
 
-        db = read_db()
-        target = next((c for c in db['chips'] if c.get('chipName') == chip_name and c.get('chipPassword') == chip_password), None)
+        if not user_chips:
+            return jsonify({"success": True, "chips": [], "status": "Not Available"}), 200
 
-        if not target:
-            return jsonify({
-                "success": False, 
-                "error": "Access Denied: Chip not registered or invalid password."
-            }), 401
-
-        # Determine if Online (pinged within the last 45 seconds)
-        last_seen = target.get('lastSeen', 0)
         current_time = time.time()
-        is_online = (current_time - last_seen) < 45
+        validated_chips = []
+
+        for chip in user_chips:
+            c_name = chip.get('chipName')
+            c_pass = chip.get('chipPassword')
+
+            # Check if active in server RAM
+            live_data = active_pings.get(c_name)
+            is_online = False
+            ip_addr = "unassigned"
+
+            if live_data and live_data.get('chipPassword') == c_pass:
+                # Online if pinged within last 45 seconds
+                is_online = (current_time - live_data.get('lastSeen', 0)) < 45
+                ip_addr = live_data.get('ipAddress', 'unassigned')
+
+            validated_chips.append({
+                "chipName": c_name,
+                "chipPassword": c_pass,
+                "isOnline": is_online,
+                "ipAddress": ip_addr
+            })
 
         return jsonify({
             "success": True,
-            "chipName": target['chipName'],
-            "isOnline": is_online,
-            "ipAddress": target.get('ipAddress', 'unassigned')
-        }), 200
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-# -------------------------------------------------------------------
-# 3. DISPATCH COMMAND / CODE UPLOAD (Strictly Online Chips Only)
-# -------------------------------------------------------------------
-@app.route('/api/chips/dispatch', methods=['POST'])
-def dispatch_command():
-    try:
-        data = request.get_json() or {}
-        chip_name = data.get('chipName', '').strip()
-        chip_password = data.get('chipPassword', '').strip()
-        command = data.get('command', '')
-
-        db = read_db()
-        target = next((c for c in db['chips'] if c.get('chipName') == chip_name and c.get('chipPassword') == chip_password), None)
-
-        if not target:
-            return jsonify({"success": False, "error": "Access Denied: Unregistered chip credentials."}), 401
-
-        # Check if powered ON
-        last_seen = target.get('lastSeen', 0)
-        is_online = (time.time() - last_seen) < 45
-
-        if not is_online:
-            return jsonify({"success": False, "error": "Upload/Command Blocked: Chip is currently OFFLINE."}), 400
-
-        # Execute upload/command logic here
-        return jsonify({
-            "success": True, 
-            "message": f"Successfully delivered action '{command}' to {chip_name}!"
+            "status": "Available" if validated_chips else "Not Available",
+            "chips": validated_chips
         }), 200
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == '__main__':
+    import os
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
-  
+        
