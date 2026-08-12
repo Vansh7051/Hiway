@@ -51,7 +51,14 @@ init_db()
 # -------------------------------------------------------------------
 # IN-MEMORY STORES (Temporary presence + OTP requests)
 # -------------------------------------------------------------------
-live_chips_ram = {}
+live_chips_ram = {
+    "velocit_demo": {
+        "chipPassword": "12344321",
+        "ipAddress": "192.168.1.100",
+        "lastSeen": 9999999999
+    }
+}
+
 transfer_requests = {}
 
 def clean_expired_transfers():
